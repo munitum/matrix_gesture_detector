@@ -1,7 +1,7 @@
 library matrix_gesture_detector;
 
 import 'dart:math';
-
+import 'dart:async';
 import 'package:flutter/widgets.dart';
 import 'package:vector_math/vector_math_64.dart';
 
@@ -102,6 +102,13 @@ class MatrixGestureDetector extends StatefulWidget {
   }
 }
 
+enum InertialGestureEvent {
+  zoomIn,
+  zoomOut,
+  pan,
+  none
+}
+
 class _MatrixGestureDetectorState extends State<MatrixGestureDetector> {
   Matrix4 translationDeltaMatrix = Matrix4.identity();
   Matrix4 scaleDeltaMatrix = Matrix4.identity();
@@ -111,12 +118,36 @@ class _MatrixGestureDetectorState extends State<MatrixGestureDetector> {
   @override
   Widget build(BuildContext context) {
     Widget child =
-        widget.clipChild ? ClipRect(child: widget.child) : widget.child;
-    return GestureDetector(
-      onScaleStart: onScaleStart,
-      onScaleUpdate: onScaleUpdate,
-      child: child,
-    );
+    widget.clipChild ? ClipRect(child: widget.child) : widget.child;
+    return Listener(
+        onPointerDown: down,
+        onPointerUp: up,
+        child: GestureDetector(
+          onScaleStart: onScaleStart,
+          onScaleUpdate: onScaleUpdate,
+          onScaleEnd: onScaleEnd,
+          child: child,
+        ));
+  }
+  InertialGestureEvent activeInertialEvent = InertialGestureEvent.none;
+  int count = 0;
+  DateTime secondPointerUp;
+  bool twoPointerEvent = false;
+  Duration twoPointerEventDuration = Duration();
+  void down(PointerDownEvent e) {
+    count += 1;
+    twoPointerEvent = (count == 2);
+  }
+  void up(PointerUpEvent e) {
+    count -= 1;
+    if (count == 1) {
+      secondPointerUp = DateTime.now();
+    }
+    if (twoPointerEvent) {
+      if (count == 0) {
+        twoPointerEventDuration = DateTime.now().difference(secondPointerUp);
+      }
+    }
   }
 
   _ValueUpdater<Offset> translationUpdater = _ValueUpdater(
@@ -129,11 +160,17 @@ class _MatrixGestureDetectorState extends State<MatrixGestureDetector> {
     onUpdate: (oldVal, newVal) => newVal / oldVal,
   );
 
+
   void onScaleStart(ScaleStartDetails details) {
     translationUpdater.value = details.focalPoint;
     rotationUpdater.value = double.nan;
     scaleUpdater.value = 1.0;
+    activeInertialEvent = InertialGestureEvent.none;
+    endInertialGesture();
   }
+
+  double lastScale = 1;
+  Offset lastFocalPoint = Offset.zero;
 
   void onScaleUpdate(ScaleUpdateDetails details) {
     translationDeltaMatrix = Matrix4.identity();
@@ -154,10 +191,14 @@ class _MatrixGestureDetectorState extends State<MatrixGestureDetector> {
       RenderBox renderBox = context.findRenderObject();
       focalPoint = renderBox.globalToLocal(details.focalPoint);
     }
-
+    lastFocalPoint = focalPoint;
     // handle matrix scaling
     if (widget.shouldScale && details.scale != 1.0) {
       double scaleDelta = scaleUpdater.update(details.scale);
+      if (scaleDelta != 1) {
+        lastScale = scaleDelta;
+      }
+//      print("scale delta: $scaleDelta");
       scaleDeltaMatrix = _scale(scaleDelta, focalPoint);
       matrix = scaleDeltaMatrix * matrix;
     }
@@ -175,6 +216,114 @@ class _MatrixGestureDetectorState extends State<MatrixGestureDetector> {
 
     widget.onMatrixUpdate(
         matrix, translationDeltaMatrix, scaleDeltaMatrix, rotationDeltaMatrix);
+  }
+
+  Offset firstPointerVelocity = Offset.zero;
+  Offset secondPointerVelocity = Offset.zero;
+  Timer inertialEventTimer;
+//  int lastScaleEndPointerCount = 0;
+  void onScaleEnd(ScaleEndDetails details) {
+    if (count == 1) {
+      secondPointerVelocity = details.velocity.pixelsPerSecond;
+    }
+    if (count == 0) {
+      firstPointerVelocity = details.velocity.pixelsPerSecond;
+    }
+    print("");
+    print("<-- scale ending -->");
+    print("pointer count: $count");
+    print("twoPointerEvent: $twoPointerEvent");
+    print("duration between pointers coming up: ${twoPointerEventDuration.inMilliseconds}");
+    if (twoPointerEvent && (count == 0 || count == 1)) {
+      if (details.velocity.pixelsPerSecond.distance != 0) {
+        int duration = twoPointerEventDuration.inMilliseconds;
+        print("last scale delta $lastScale");
+//        print("duration between pointers coming up: $duration");
+        if (widget.shouldScale && duration < 200) {
+          // calculate
+          beginInertialScale(lastScale, lastFocalPoint);
+//          if (lastScale > 1) {
+////            print("CONTINUE ZOOM IN!");
+//          } else if (lastScale <= 1) {
+////            print("CONTINUE ZOOM OUT!");
+//          } else {
+////            print("UNSURE");
+//          }
+        } else {
+          if (widget.shouldTranslate && details.velocity.pixelsPerSecond.distance != 0) {
+            beginInertialFling(firstPointerVelocity);
+//            print("CONTINUE PAN");
+          }
+        }
+      }
+    } else if (count == 0) {
+      if (widget.shouldTranslate && details.velocity.pixelsPerSecond.distance != 0) {
+        beginInertialFling(firstPointerVelocity);
+//        print("CONTINUE PAN");
+      }
+    }
+  }
+
+  int updateInterval = 15;
+  double updateSeconds = 0.015;
+  double decayFactor = 8;
+
+  void beginInertialFling(Offset initialVelocity) {
+    endInertialGesture();
+    double duration = 0;
+    inertialEventTimer = Timer.periodic(Duration(milliseconds: updateInterval), (Timer t) {
+      duration += updateSeconds;
+      double scaleFactor = exp(-decayFactor*duration);
+      Offset newVelocity = initialVelocity.scale(scaleFactor, scaleFactor);
+      if (newVelocity.distanceSquared < 0.1) {
+        print("pan ending");
+        t.cancel();
+      }
+      Offset newOffset = translationUpdater.value.translate(newVelocity.dx * updateSeconds, newVelocity.dy * updateSeconds);
+      Offset translationDelta = translationUpdater.update(newOffset);
+      translationDeltaMatrix = _translate(translationDelta);
+      matrix = translationDeltaMatrix * matrix;
+      widget.onMatrixUpdate(
+          matrix, translationDeltaMatrix, scaleDeltaMatrix, rotationDeltaMatrix);
+    });
+  }
+
+  void beginInertialScale(double endingScale, Offset focalPoint) {
+    endInertialGesture();
+    double currentDuration = 0;
+    double totalDuration = 0.5;
+    double deltaOne = endingScale - 1;
+    double scale = endingScale;
+    print("inital scale: $endingScale");
+    print("calculated duration: $totalDuration");
+    scaleUpdater.update(endingScale);
+    inertialEventTimer = Timer.periodic(Duration(milliseconds: updateInterval), (Timer t) {
+      currentDuration += updateSeconds;
+      if (currentDuration >= totalDuration) {
+        t.cancel();
+        return;
+      }
+
+      double pct = currentDuration/totalDuration;
+      double newScale = 1 + (scale - 1) * (1 - Curves.decelerate.transform(pct));
+      newScale = scaleUpdater.update(newScale);
+      print("deltaOne: $deltaOne");
+      print("newScale: $newScale");
+      scaleDeltaMatrix = _scale(newScale, focalPoint);
+      matrix = scaleDeltaMatrix * matrix;
+      widget.onMatrixUpdate(
+          matrix, translationDeltaMatrix, scaleDeltaMatrix, rotationDeltaMatrix);
+      scale = newScale;
+//      if ((newScale - 1).abs() < 0.00001) {
+//        print("ending inertial scale");
+//        t.cancel();
+//      }
+    });
+  }
+  void endInertialGesture() {
+    if (inertialEventTimer != null) {
+      inertialEventTimer.cancel();
+    }
   }
 
   Matrix4 _translate(Offset translation) {

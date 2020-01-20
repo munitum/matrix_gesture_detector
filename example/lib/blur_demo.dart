@@ -48,19 +48,22 @@ class ImageData {
   String assetName;
   ImageStream imageStream;
   ImageProvider imageProvider;
+  ImageStreamListener imageSteamListener;
   ui.Image image;
   ValueNotifier<int> notifier;
   Size size;
 
   ImageData(this.assetName, this.notifier)
-      : imageProvider = AssetImage(assetName);
+      : imageProvider = AssetImage(assetName) {
+    imageSteamListener = ImageStreamListener(imageLoaded);
+  }
 
   void resolve(BuildContext context) {
     ImageStream oldImageStream = imageStream;
     imageStream = imageProvider.resolve(createLocalImageConfiguration(context));
     if (imageStream.key != oldImageStream?.key) {
-      oldImageStream?.removeListener(imageLoaded);
-      imageStream.addListener(imageLoaded);
+      oldImageStream?.removeListener(imageSteamListener);
+      imageStream.addListener(imageSteamListener);
     }
   }
 
